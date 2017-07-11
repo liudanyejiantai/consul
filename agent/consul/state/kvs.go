@@ -9,6 +9,8 @@ import (
 	"github.com/hashicorp/go-memdb"
 )
 
+const recursive_delete_threshold = 100
+
 // KVs is used to pull the full list of KVS entries for use during snapshots.
 func (s *Snapshot) KVs() (memdb.ResultIterator, error) {
 	iter, err := s.tx.Get("kvs", "id_prefix")
@@ -406,20 +408,40 @@ func (s *Store) kvsSetCASTxn(tx *memdb.Txn, idx uint64, entry *structs.DirEntry)
 // in the state store. If any keys are modified, the last index is
 // set, otherwise this is a no-op.
 func (s *Store) KVSDeleteTree(idx uint64, prefix string) error {
+	readTX := s.db.Txn(false)
+	defer readTX.Abort()
+	// Get an iterator over all of the keys with the given prefix.
+	entries, err := readTX.Get("kvs", "id_prefix", prefix)
+	if err != nil {
+		return fmt.Errorf("failed kvs lookup: %s", err)
+	}
+
+	// Do a pass at counting keys, if they exceed a threshold, call the more efficient DeletePrefix instead
+	count := 0
+	usePrefixDelete := false
+	for entry := entries.Next(); entry != nil; entry = entries.Next() {
+		count++
+		if count > recursive_delete_threshold {
+			usePrefixDelete = true
+			break
+		}
+	}
+
 	tx := s.db.Txn(true)
 	defer tx.Abort()
 
-	if err := s.kvsDeleteTreeTxn(tx, idx, prefix); err != nil {
+	if err := s.kvsDeleteTreeTxn(tx, idx, prefix, usePrefixDelete); err != nil {
 		return err
 	}
 
 	tx.Commit()
 	return nil
+
 }
 
 // kvsDeleteTreeTxn is the inner method that does a recursive delete inside an
 // existing transaction.
-func (s *Store) kvsDeleteTreeTxn(tx *memdb.Txn, idx uint64, prefix string) error {
+func (s *Store) kvsDeleteTreeTxn(tx *memdb.Txn, idx uint64, prefix string, usePrefixDelete bool) error {
 	// Get an iterator over all of the keys with the given prefix.
 	entries, err := tx.Get("kvs", "id_prefix", prefix)
 	if err != nil {
@@ -429,22 +451,38 @@ func (s *Store) kvsDeleteTreeTxn(tx *memdb.Txn, idx uint64, prefix string) error
 	// Go over all of the keys and remove them. We call the delete
 	// directly so that we only update the index once. We also add
 	// tombstones as we go.
+
+	// For prefix deletes, only insert one tombstone and delete the entire subtree
 	var modified bool
 	var objs []interface{}
-	for entry := entries.Next(); entry != nil; entry = entries.Next() {
-		e := entry.(*structs.DirEntry)
-		if err := s.kvsGraveyard.InsertTxn(tx, e.Key, idx); err != nil {
+
+	if usePrefixDelete {
+		entry := entries.Next()
+		first := entry.(*structs.DirEntry)
+		if err := s.kvsGraveyard.InsertTxn(tx, first.Key, idx); err != nil {
 			return fmt.Errorf("failed adding to graveyard: %s", err)
 		}
-		objs = append(objs, entry)
-		modified = true
-	}
 
-	// Do the actual deletes in a separate loop so we don't trash the
-	// iterator as we go.
-	for _, obj := range objs {
-		if err := tx.Delete("kvs", obj); err != nil {
-			return fmt.Errorf("failed deleting kvs entry: %s", err)
+		fmt.Printf("Attempting prefix delete on %+v\n", first)
+		if err := tx.DeletePrefix("kvs", first); err != nil {
+			return fmt.Errorf("failed recursive  deleting kvs entry: %s", err)
+		}
+	} else {
+		//insert tombstones for all records
+		for entry := entries.Next(); entry != nil; entry = entries.Next() {
+			e := entry.(*structs.DirEntry)
+			if err := s.kvsGraveyard.InsertTxn(tx, e.Key, idx); err != nil {
+				return fmt.Errorf("failed adding to graveyard: %s", err)
+			}
+			objs = append(objs, entry)
+			modified = true
+		}
+		// Do the actual deletes in a separate loop so we don't trash the
+		// iterator as we go.
+		for _, obj := range objs {
+			if err := tx.Delete("kvs", obj); err != nil {
+				return fmt.Errorf("failed deleting kvs entry: %s", err)
+			}
 		}
 	}
 

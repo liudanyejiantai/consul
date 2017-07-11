@@ -29,7 +29,7 @@ func (s *Store) txnKVS(tx *memdb.Txn, idx uint64, op *structs.TxnKVOp) (structs.
 		}
 
 	case api.KVDeleteTree:
-		err = s.kvsDeleteTreeTxn(tx, idx, op.DirEnt.Key)
+		err = s.kvsDeleteTreeTxn(tx, idx, op.DirEnt.Key, false)
 
 	case api.KVCAS:
 		var ok bool

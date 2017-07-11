@@ -290,3 +290,19 @@ func recursiveWalk(n *Node, fn WalkFn) bool {
 	}
 	return false
 }
+
+// Visit all the nodes in the tree under n, and expire them after invoking fn
+func recursiveWatchNotify(n *Node, fn func(n *Node) bool) bool {
+	if n.leaf != nil && fn(n) {
+		close(n.leaf.mutateCh)
+		return true
+	}
+	close(n.mutateCh)
+	// Recurse on the children
+	for _, e := range n.edges {
+		if recursiveWatchNotify(e.node, fn) {
+			return true
+		}
+	}
+	return false
+}

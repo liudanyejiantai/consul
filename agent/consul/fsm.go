@@ -178,7 +178,11 @@ func (c *consulFSM) applyKVSOperation(buf []byte, index uint64) interface{} {
 		}
 		return act
 	case api.KVDeleteTree:
-		return c.state.KVSDeleteTree(index, req.DirEnt.Key)
+		err := c.state.KVSDeleteTree(index, req.DirEnt.Key)
+		if err != nil {
+			c.logger.Println("***** ERROR in delete tree ", err)
+		}
+		return err
 	case api.KVCAS:
 		act, err := c.state.KVSSetCAS(index, &req.DirEnt)
 		if err != nil {

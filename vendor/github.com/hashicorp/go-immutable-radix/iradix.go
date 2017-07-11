@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 
+	"fmt"
+
 	"github.com/hashicorp/golang-lru/simplelru"
 )
 
@@ -357,6 +359,62 @@ func (t *Txn) delete(parent, n *Node, search []byte) (*Node, *leafNode) {
 	return nc, leaf
 }
 
+// delete does a recursive deletion
+func (t *Txn) deletePrefix(parent, n *Node, search []byte) (*Node, int) {
+	// Check for key exhaustion
+	if len(search) == 0 {
+		// Remove the leaf node
+		nc := t.writeNode(n, true)
+		subTreeSize := 0 //count this node
+		//recursively walk from all edges of this node, closing their mutate channels
+		for _, e := range n.edges {
+			recursiveWatchNotify(e.node, func(n *Node) bool {
+				subTreeSize++
+				return false
+			})
+		}
+		fmt.Println("SUB TREE SIZE ", subTreeSize)
+		if n.isLeaf() {
+			nc.leaf = nil
+		}
+		fmt.Println("LENGTH of edges  ", len(nc.edges))
+		nc.edges = nil // deletes the entire subtree
+
+		return nc, subTreeSize
+	}
+
+	// Look for an edge
+	label := search[0]
+	idx, child := n.getEdge(label)
+	if child == nil || !bytes.HasPrefix(search, child.prefix) {
+		return nil, 0
+	}
+
+	// Consume the search prefix
+	search = search[len(child.prefix):]
+	newChild, numDeletions := t.deletePrefix(n, child, search)
+	if newChild == nil {
+		return nil, 0
+	}
+
+	// Copy this node. WATCH OUT - it's safe to pass "false" here because we
+	// will only ADD a leaf via nc.mergeChild() if there isn't one due to
+	// the !nc.isLeaf() check in the logic just below. This is pretty subtle,
+	// so be careful if you change any of the logic here.
+	nc := t.writeNode(n, false)
+
+	// Delete the edge if the node has no edges
+	if newChild.leaf == nil && len(newChild.edges) == 0 {
+		nc.delEdge(label)
+		if n != t.root && len(nc.edges) == 1 && !nc.isLeaf() {
+			t.mergeChild(nc)
+		}
+	} else {
+		nc.edges[idx].node = newChild
+	}
+	return nc, numDeletions
+}
+
 // Insert is used to add or update a given key. The return provides
 // the previous value and a bool indicating if any was set.
 func (t *Txn) Insert(k []byte, v interface{}) (interface{}, bool) {
@@ -382,6 +440,23 @@ func (t *Txn) Delete(k []byte) (interface{}, bool) {
 		return leaf.val, true
 	}
 	return nil, false
+}
+
+// DeletePrefix is used to delete an entire subtree that matches the prefix
+// This will delete all nodes under that prefix
+func (t *Txn) DeletePrefix(prefix []byte) bool {
+	prefix = bytes.Trim(prefix, "\x00")
+	newRoot, numDeletions := t.deletePrefix(nil, t.root, prefix)
+	if newRoot != nil {
+		t.root = newRoot
+	}
+	if numDeletions > 0 {
+		t.size = t.size - numDeletions
+		fmt.Println("Nodes deleted = ", numDeletions)
+		fmt.Println("Tree size = ", t.size)
+		return true
+	}
+	return false
 }
 
 // Root returns the current root of the radix tree within this
@@ -522,6 +597,14 @@ func (t *Tree) Delete(k []byte) (*Tree, interface{}, bool) {
 	txn := t.Txn()
 	old, ok := txn.Delete(k)
 	return txn.Commit(), old, ok
+}
+
+// Delete is used to delete a given key. Returns the new tree,
+// old value if any, and a bool indicating if the key was set.
+func (t *Tree) DeletePrefix(k []byte) (*Tree, bool) {
+	txn := t.Txn()
+	ok := txn.DeletePrefix(k)
+	return txn.Commit(), ok
 }
 
 // Root returns the root node of the tree which can be used for richer

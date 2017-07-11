@@ -117,13 +117,22 @@ func (txn *Txn) Commit() {
 	// Commit each sub-transaction scoped to (table, index)
 	for key, subTxn := range txn.modified {
 		path := indexPath(key.Table, key.Index)
-		final := subTxn.Commit()
+		final := subTxn.CommitOnly()
 		txn.rootTxn.Insert(path, final)
 	}
 
 	// Update the root of the DB
-	newRoot := txn.rootTxn.Commit()
+	newRoot := txn.rootTxn.CommitOnly()
 	atomic.StorePointer(&txn.db.root, unsafe.Pointer(newRoot))
+
+	// Now issue all of the mutation updates (this is safe to call
+	// even if mutation tracking isn't enabled); we do this after
+	// the root pointer is swapped so that waking responders will
+	// see the new state.
+	for _, subTxn := range txn.modified {
+		subTxn.Notify()
+	}
+	txn.rootTxn.Notify()
 
 	// Clear the txn
 	txn.rootTxn = nil
@@ -315,6 +324,73 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 					val = append(val, idVal...)
 				}
 				indexTxn.Delete(val)
+			}
+		}
+	}
+	return nil
+}
+
+// DeletePrefix is used to delete a single object from the given table
+// This object must already exist in the table
+func (txn *Txn) DeletePrefix(table string, obj interface{}) error {
+	if !txn.write {
+		return fmt.Errorf("cannot delete in read-only transaction")
+	}
+
+	// Get the table schema
+	tableSchema, ok := txn.db.schema.Tables[table]
+	if !ok {
+		return fmt.Errorf("invalid table '%s'", table)
+	}
+
+	// Get the primary ID of the object
+	idSchema := tableSchema.Indexes[id]
+	idIndexer := idSchema.Indexer.(SingleIndexer)
+	ok, idVal, err := idIndexer.FromObject(obj)
+	if err != nil {
+		return fmt.Errorf("failed to build primary index: %v", err)
+	}
+	if !ok {
+		return fmt.Errorf("object missing primary index")
+	}
+
+	// Lookup the object by ID first, check fi we should continue
+	idTxn := txn.writableIndex(table, id)
+	existing, ok := idTxn.Get(idVal)
+	if !ok {
+		return fmt.Errorf("not found")
+	}
+
+	// Remove the object from all the indexes
+	for name, indexSchema := range tableSchema.Indexes {
+		indexTxn := txn.writableIndex(table, name)
+
+		// Handle the update by deleting from the index first
+		var (
+			ok   bool
+			vals [][]byte
+			err  error
+		)
+		switch indexer := indexSchema.Indexer.(type) {
+		case SingleIndexer:
+			var val []byte
+			ok, val, err = indexer.FromObject(existing)
+			vals = [][]byte{val}
+		case MultiIndexer:
+			ok, vals, err = indexer.FromObject(existing)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to build index '%s': %v", name, err)
+		}
+		if ok {
+			// Handle non-unique index by computing a unique index.
+			// This is done by appending the primary key which must
+			// be unique anyways.
+			for _, val := range vals {
+				if !indexSchema.Unique {
+					val = append(val, idVal...)
+				}
+				indexTxn.DeletePrefix(val)
 			}
 		}
 	}
